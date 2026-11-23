@@ -30,6 +30,7 @@
 //! ```
 
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet},
     ops::Deref,
 };
@@ -69,6 +70,12 @@ impl XdgForeignHandle {
 impl Deref for XdgForeignHandle {
     type Target = str;
     fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for XdgForeignHandle {
+    fn borrow(&self) -> &str {
         &self.0
     }
 }
@@ -128,5 +135,14 @@ impl XdgForeignState {
     /// Returns the xdg_importer global.
     pub fn importer_global(&self) -> GlobalId {
         self.importer.clone()
+    }
+
+    /// Returns the surface exported as `handle` (what `xdg_exported.handle`
+    /// gave the exporting client), if it's still exported.
+    ///
+    /// Useful to find the window a portal request names as its parent
+    /// (`wayland:<handle>`).
+    pub fn exported_surface(&self, handle: &str) -> Option<&WlSurface> {
+        self.exported.get(handle).map(|state| &state.exported_surface)
     }
 }
