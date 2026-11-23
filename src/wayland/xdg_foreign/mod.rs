@@ -129,4 +129,16 @@ impl XdgForeignState {
     pub fn importer_global(&self) -> GlobalId {
         self.importer.clone()
     }
+
+    /// Returns the surface exported as `handle` (what `xdg_exported.handle`
+    /// gave the exporting client), if it's still exported.
+    ///
+    /// Useful to find the window a portal request names as its parent
+    /// (`wayland:<handle>`).
+    pub fn exported_surface(&self, handle: &str) -> Option<&WlSurface> {
+        self.exported
+            .iter()
+            .find(|(exported, _)| exported.as_str() == handle)
+            .map(|(_, state)| &state.exported_surface)
+    }
 }
