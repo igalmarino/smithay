@@ -868,6 +868,58 @@ impl GlesRenderer {
     }
 }
 
+/// The most bytes one `glTexSubImage2D` of a client's buffer uploads. Drivers
+/// copy larger ones through a staging buffer of their size, which radeonsi
+/// allocates anew when its last one is still in use: a 1920x1080 ARGB8888
+/// buffer took 10 to 13 ms of CPU to upload whole, about one time in three,
+/// and about 1 ms every time in strips of this size.
+#[cfg(feature = "wayland_frontend")]
+const MAX_UPLOAD_STRIP: i32 = 128 * 1024;
+
+/// Upload `region` of the pixels at `pixels` (rows `UNPACK_ROW_LENGTH` long)
+/// to the bound texture, in strips of at most `MAX_UPLOAD_STRIP` bytes.
+///
+/// # Safety
+///
+/// The texture is bound and `pixels` holds `region` of a buffer laid out as
+/// `UNPACK_ROW_LENGTH` says.
+#[cfg(feature = "wayland_frontend")]
+unsafe fn upload_in_strips(
+    gl: &ffi::Gles2,
+    region: Rectangle<i32, BufferCoord>,
+    pixelsize: i32,
+    format: ffi::types::GLenum,
+    type_: ffi::types::GLenum,
+    pixels: *const u8,
+) {
+    if region.size.w <= 0 || region.size.h <= 0 {
+        return;
+    }
+    let row = region.size.w.saturating_mul(pixelsize).max(1);
+    let rows = (MAX_UPLOAD_STRIP / row).max(1);
+    let bottom = region.loc.y + region.size.h;
+    gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, region.loc.x);
+    let mut y = region.loc.y;
+    while y < bottom {
+        let height = rows.min(bottom - y);
+        gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, y);
+        gl.TexSubImage2D(
+            ffi::TEXTURE_2D,
+            0,
+            region.loc.x,
+            y,
+            region.size.w,
+            height,
+            format,
+            type_,
+            pixels as *const _,
+        );
+        y += height;
+    }
+    gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, 0);
+    gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, 0);
+}
+
 #[cfg(feature = "wayland_frontend")]
 impl ImportMemWl for GlesRenderer {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
@@ -972,8 +1024,10 @@ impl ImportMemWl for GlesRenderer {
                 self.gl
                     .PixelStorei(ffi::UNPACK_ROW_LENGTH, stride / pixelsize as i32);
 
-                if upload_full || damage.is_empty() {
+                let buffer_rect = Rectangle::from_size(Size::from((width, height)));
+                if upload_full {
                     trace!("Uploading shm texture");
+                    // Allocated empty, then filled in strips like any damage.
                     self.gl.TexImage2D(
                         ffi::TEXTURE_2D,
                         0,
@@ -983,27 +1037,23 @@ impl ImportMemWl for GlesRenderer {
                         0,
                         read_format,
                         type_,
-                        ptr.offset(offset as isize) as *const _,
+                        std::ptr::null(),
+                    );
+                }
+                let pixels = ptr.offset(offset as isize);
+                if upload_full || damage.is_empty() {
+                    upload_in_strips(
+                        &self.gl,
+                        buffer_rect,
+                        pixelsize as i32,
+                        read_format,
+                        type_,
+                        pixels,
                     );
                 } else {
-                    let buffer_rect = Rectangle::from_size(Size::from((width, height)));
                     for region in damage.iter().filter_map(|r| r.intersection(buffer_rect)) {
                         trace!("Uploading partial shm texture");
-                        self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, region.loc.x);
-                        self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, region.loc.y);
-                        self.gl.TexSubImage2D(
-                            ffi::TEXTURE_2D,
-                            0,
-                            region.loc.x,
-                            region.loc.y,
-                            region.size.w,
-                            region.size.h,
-                            read_format,
-                            type_,
-                            ptr.offset(offset as isize) as *const _,
-                        );
-                        self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, 0);
-                        self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, 0);
+                        upload_in_strips(&self.gl, region, pixelsize as i32, read_format, type_, pixels);
                     }
                 }
 
