@@ -27,6 +27,8 @@ mod error;
 pub mod format;
 pub mod profiler;
 mod shaders;
+#[cfg(feature = "wayland_frontend")]
+mod shm_upload;
 mod texture;
 mod uniform;
 mod version;
@@ -408,6 +410,8 @@ pub struct GlesRenderer {
     buffers: Vec<GlesBuffer>,
     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
     vbos: [ffi::types::GLuint; 2],
+    #[cfg(feature = "wayland_frontend")]
+    shm_uploads: shm_upload::ShmUploads,
     vertices: Vec<f32>,
     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
     opaque_damage: Vec<Rectangle<i32, Physical>>,
@@ -748,6 +752,8 @@ impl GlesRenderer {
 
             buffers: Vec::new(),
             dmabuf_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "wayland_frontend")]
+            shm_uploads: Default::default(),
             vertices: Vec::with_capacity(6 * 16),
             non_opaque_damage: Vec::with_capacity(16),
             opaque_damage: Vec::with_capacity(16),
@@ -874,7 +880,9 @@ impl GlesRenderer {
 /// buffer took 10 to 13 ms of CPU to upload whole, about one time in three,
 /// and 128 KiB strips on a fresh 2560x1440 buffer still took 13 to 16 ms on
 /// a Renoir APU; 64 KiB strips keep 1080p under 4 ms (~1 ms steady) and 1440p
-/// under 6 ms (~2 ms steady).
+/// under 6 ms (~2 ms steady). With GLES 3, uploads of `shm_upload::MIN_BYTES`
+/// or more go through the renderer's own pixel unpack buffers instead
+/// (`shm_upload.rs`); these strips are for the rest.
 #[cfg(feature = "wayland_frontend")]
 const MAX_UPLOAD_STRIP: i32 = 64 * 1024;
 
@@ -1027,6 +1035,7 @@ impl ImportMemWl for GlesRenderer {
                     .PixelStorei(ffi::UNPACK_ROW_LENGTH, stride / pixelsize as i32);
 
                 let buffer_rect = Rectangle::from_size(Size::from((width, height)));
+                let allocating = std::time::Instant::now();
                 if upload_full {
                     trace!("Uploading shm texture");
                     // Allocated empty, then filled in strips like any damage.
@@ -1041,20 +1050,53 @@ impl ImportMemWl for GlesRenderer {
                         type_,
                         std::ptr::null(),
                     );
+                    let elapsed = allocating.elapsed();
+                    if elapsed > std::time::Duration::from_millis(2) {
+                        debug!(
+                            width,
+                            height,
+                            ms = elapsed.as_secs_f64() * 1000.0,
+                            "slow shm texture allocation"
+                        );
+                    }
                 }
                 let pixels = ptr.offset(offset as isize);
-                if upload_full || damage.is_empty() {
-                    upload_in_strips(
+                let regions: Vec<_> = if upload_full || damage.is_empty() {
+                    vec![buffer_rect]
+                } else {
+                    damage
+                        .iter()
+                        .filter_map(|r| r.intersection(buffer_rect))
+                        .collect()
+                };
+                let bytes: usize = regions
+                    .iter()
+                    .map(|r| r.size.w as usize * r.size.h as usize * pixelsize)
+                    .sum();
+                // Large uploads through the renderer's own pixel unpack
+                // buffers (`shm_upload.rs`), the rest straight, in strips.
+                let through_buffers = self.gl_version.major >= 3
+                    && bytes >= shm_upload::MIN_BYTES
+                    && self.shm_uploads.upload(
                         &self.gl,
-                        buffer_rect,
-                        pixelsize as i32,
+                        &regions,
+                        pixels,
+                        stride as usize,
+                        pixelsize,
                         read_format,
                         type_,
-                        pixels,
                     );
-                } else {
-                    for region in damage.iter().filter_map(|r| r.intersection(buffer_rect)) {
-                        trace!("Uploading partial shm texture");
+                if !through_buffers {
+                    if self.gl_version.major >= 3 && bytes >= shm_upload::MIN_BYTES {
+                        warn!(
+                            bytes,
+                            "shm upload through pixel unpack buffers failed: uploading directly"
+                        );
+                    }
+                    self.gl
+                        .PixelStorei(ffi::UNPACK_ROW_LENGTH, stride / pixelsize as i32);
+                    for region in regions {
+                        trace!("Uploading shm texture region");
                         upload_in_strips(&self.gl, region, pixelsize as i32, read_format, type_, pixels);
                     }
                 }
@@ -1978,6 +2020,70 @@ impl Blit for GlesRenderer {
     }
 }
 
+impl GlesRenderer {
+    /// Make room ahead for shm buffers of up to `bytes` (e.g. an output's
+    /// size, as it's set up), so the first upload of that size doesn't pay
+    /// the one-time cost of the renderer's pixel unpack buffers
+    /// (`shm_upload.rs`). Returns whether they hold it now: false without
+    /// GLES 3, or for less than uploads go through them for.
+    #[cfg(feature = "wayland_frontend")]
+    pub fn reserve_shm_uploads(&mut self, bytes: usize) -> Result<bool, GlesError> {
+        if self.gl_version.major < 3 || bytes < shm_upload::MIN_BYTES {
+            return Ok(false);
+        }
+        unsafe {
+            self.egl.make_current()?;
+            if !self.shm_uploads.reserve(&self.gl, bytes) {
+                return Ok(false);
+            }
+            if self.shm_uploads.warmed {
+                return Ok(true);
+            }
+            self.shm_uploads.warmed = true;
+            // A first upload through them, in each buffer and in the formats
+            // clients use most, so the driver's one-time work for that path
+            // is done now too.
+            const SIZE: i32 = 16;
+            let pixels = [0u8; (SIZE * SIZE * 4) as usize];
+            let region = [Rectangle::from_size(Size::from((SIZE, SIZE)))];
+            for fourcc in [Fourcc::Argb8888, Fourcc::Abgr8888] {
+                let Some((internal, format, type_)) = fourcc_to_gl_formats(fourcc) else {
+                    continue;
+                };
+                let mut tex = 0;
+                self.gl.GenTextures(1, &mut tex);
+                self.gl.BindTexture(ffi::TEXTURE_2D, tex);
+                self.gl.TexImage2D(
+                    ffi::TEXTURE_2D,
+                    0,
+                    internal as i32,
+                    SIZE,
+                    SIZE,
+                    0,
+                    format,
+                    type_,
+                    ptr::null(),
+                );
+                for _ in 0..2 {
+                    self.shm_uploads.upload(
+                        &self.gl,
+                        &region,
+                        pixels.as_ptr(),
+                        (SIZE * 4) as usize,
+                        4,
+                        format,
+                        type_,
+                    );
+                }
+                self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, 0);
+                self.gl.BindTexture(ffi::TEXTURE_2D, 0);
+                self.gl.DeleteTextures(1, &tex);
+            }
+            Ok(true)
+        }
+    }
+}
+
 impl Drop for GlesRenderer {
     fn drop(&mut self) {
         let _guard = self.span.enter();
@@ -1986,6 +2092,8 @@ impl Drop for GlesRenderer {
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
                 self.gl.DeleteProgram(self.solid_program.program);
                 self.gl.DeleteBuffers(self.vbos.len() as i32, self.vbos.as_ptr());
+                #[cfg(feature = "wayland_frontend")]
+                self.shm_uploads.destroy(&self.gl);
 
                 self.profiler.cleanup(Some(&self.gl));
 
